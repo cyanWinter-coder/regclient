@@ -17,8 +17,10 @@ package auth
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,6 +34,56 @@ import (
 	"github.com/regclient/regclient/internal/regnet"
 	"github.com/regclient/regclient/types/errs"
 )
+
+// redactedQueryParams are query parameters that may carry host credentials.
+// They are replaced with redactedValue in logs.
+var redactedQueryParams = map[string]bool{
+	"account":  true,
+	"password": true,
+	"token":    true,
+}
+
+const redactedValue = "[redacted]"
+
+// redactURL returns a copy of the URL string with credential-bearing query
+// parameters and any user info removed. It is safe to log the result.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return redactedValue
+	}
+	if u.User != nil {
+		u.User = url.User(redactedValue)
+	}
+	q := u.Query()
+	changed := false
+	for k := range q {
+		if redactedQueryParams[strings.ToLower(k)] {
+			q.Set(k, redactedValue)
+			changed = true
+		}
+	}
+	if changed {
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
+
+// redactError returns an error safe to log, replacing any URL embedded in a
+// [url.Error] with a redacted copy. Nested url.Error values are redacted too.
+// Network errors otherwise do not carry request credentials, but the token
+// endpoint URL may include an account.
+func redactError(err error) error {
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		return err
+	}
+	return &url.Error{
+		Op:  ue.Op,
+		URL: redactURL(ue.URL),
+		Err: redactError(ue.Err),
+	}
+}
 
 type charLU byte
 
@@ -86,6 +138,13 @@ type handler interface {
 	AddScope(scope string) error
 	ProcessChallenge(challenge) error
 	UpdateRequest(*http.Request) error
+}
+
+// asyncHandler is implemented by handlers that must not run under the Auth
+// mutex, typically because their UpdateRequest makes HTTP calls.
+// The handler is expected to provide its own internal synchronization.
+type asyncHandler interface {
+	UpdateRequestAsync(*http.Request) error
 }
 
 // handlerBuild is used to make a new handler for a specific authType and URL
@@ -223,8 +282,15 @@ func (a *Auth) HandleResponse(resp *http.Response) error {
 	if err != nil {
 		return err
 	}
-	a.slog.Debug("Auth request parsed",
-		slog.Any("challenge", cl))
+	if len(cl) > 0 {
+		authTypes := make([]string, 0, len(cl))
+		for _, c := range cl {
+			authTypes = append(authTypes, c.authType)
+		}
+		a.slog.Debug("Auth request parsed",
+			slog.String("host", host),
+			slog.Any("authtypes", authTypes))
+	}
 	if len(cl) < 1 {
 		return errs.ErrEmptyChallenge
 	}
@@ -273,29 +339,36 @@ func (a *Auth) HandleResponse(resp *http.Response) error {
 // UpdateRequest adds Authorization headers to a request
 func (a *Auth) UpdateRequest(req *http.Request) error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	host := req.URL.Host
 	if a.hs[host] == nil {
+		a.mu.Unlock()
 		return nil
 	}
-	var err error
+	var h handler
 	for _, at := range a.authTypes {
 		if a.hs[host][at] != nil {
-			err = a.hs[host][at].UpdateRequest(req)
-			if err != nil {
-				a.slog.Debug("Failed to generate auth",
-					slog.String("err", err.Error()),
-					slog.String("host", host),
-					slog.String("authtype", at))
-				continue
-			}
+			h = a.hs[host][at]
 			break
 		}
 	}
-	if err != nil {
-		return err
+	// handlers making outbound calls run without the Auth mutex so concurrent
+	// token refreshes coalesce instead of serializing every request
+	async, isAsync := h.(asyncHandler)
+	if isAsync {
+		a.mu.Unlock()
+		return async.UpdateRequestAsync(req)
 	}
-	return nil
+	defer a.mu.Unlock()
+	if h == nil {
+		return nil
+	}
+	err := h.UpdateRequest(req)
+	if err != nil {
+		a.slog.Debug("Failed to generate auth",
+			slog.String("err", err.Error()),
+			slog.String("host", host))
+	}
+	return err
 }
 
 func (a *Auth) addDefaultHandlers() {
@@ -494,7 +567,9 @@ func (b *basicHandler) ProcessChallenge(c challenge) error {
 	return errs.ErrNoNewChallenge
 }
 
-// UpdateRequest for BasicHandler generates base64 encoded user/pass for a host
+// UpdateRequest for BasicHandler generates base64 encoded user/pass for a host.
+// Basic credentials are stateless and re-attached on redirects; the caller is
+// responsible for bounding retries after a rejected challenge.
 func (b *basicHandler) UpdateRequest(req *http.Request) error {
 	cred := b.credsFn(b.host)
 	if cred.User == "" || cred.Password == "" {
@@ -503,19 +578,6 @@ func (b *basicHandler) UpdateRequest(req *http.Request) error {
 	req.Header.Set("Authorization", fmt.Sprintf("Basic %s",
 		base64.StdEncoding.EncodeToString([]byte(cred.User+":"+cred.Password))))
 	return nil
-}
-
-// bearerHandler supports Bearer auth type requests
-type bearerHandler struct {
-	client         *http.Client
-	clientID       string
-	realm, service string
-	host           string
-	credsFn        CredsFn
-	scopes         []string
-	tokenURL       *url.URL
-	token          bearerToken
-	slog           *slog.Logger
 }
 
 // bearerToken is the json response to the Bearer request
@@ -528,6 +590,53 @@ type bearerToken struct {
 	Scope        string    `json:"scope"`
 }
 
+// bearerHandler supports Bearer auth type requests.
+//
+// Tokens are cached per (registry host, realm, service, sorted scopes)
+// identity so that mirrors sharing a host but presenting different
+// challenges never reuse a token scoped for another realm or scope set.
+// Each challenge change starts a new generation: the previous entry stays
+// available for requests already in flight while new requests resolve
+// against the new generation.
+type bearerHandler struct {
+	client   *http.Client
+	clientID string
+	host     string
+	credsFn  CredsFn
+	slog     *slog.Logger
+
+	mu         sync.Mutex
+	realm      string
+	service    string
+	scopes     []string // scopes accumulated before a realm/service is known
+	generation uint64
+	cur        *bearerEntry
+	entries    map[bearerKey]*bearerEntry
+}
+
+// bearerKey is the cache identity of a token. It includes the registry,
+// realm, service, and the sorted, non-empty scopes.
+type bearerKey struct {
+	host    string
+	realm   string
+	service string
+	scopes  string // scopes joined with a space after sorting
+}
+
+// bearerEntry is one cached token identity.
+type bearerEntry struct {
+	key      bearerKey
+	scopes   []string
+	tokenURL *url.URL
+	token    bearerToken
+
+	// refresh coalescing: at most one outbound token request per entry,
+	// other callers wait on done and share the leader's result
+	refreshMu sync.Mutex
+	done      chan struct{}
+	err       error
+}
+
 // NewBearerHandler creates a new BearerHandler
 func NewBearerHandler(client *http.Client, clientID, host string, credsFn CredsFn, slog *slog.Logger) handler {
 	return &bearerHandler{
@@ -535,31 +644,39 @@ func NewBearerHandler(client *http.Client, clientID, host string, credsFn CredsF
 		clientID: clientID,
 		host:     host,
 		credsFn:  credsFn,
-		realm:    "",
-		service:  "",
 		scopes:   []string{},
+		entries:  map[bearerKey]*bearerEntry{},
 		slog:     slog,
 	}
 }
 
 // AddScope appends a new scope if it doesn't already exist
 func (b *bearerHandler) AddScope(scope string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.scopeExists(scope) {
-		if b.token.Token == "" || !b.isExpired() {
+		if b.cur == nil || b.cur.usable() {
 			return errs.ErrNoNewChallenge
 		}
+		// scope exists but the cached token is gone or expired: let the
+		// caller trigger a refresh for the current identity
 		return nil
 	}
 	b.addScope(scope)
+	if b.realm == "" {
+		return nil
+	}
+	// resolve the new identity, starting a new generation when it changes
+	b.resolveLocked()
 	return nil
 }
 
+// addScope appends a scope, extending an existing repository scope when
+// possible. It does not mutate any cached token.
 func (b *bearerHandler) addScope(scope string) {
 	if !b.tryExtendExistingScope(scope) {
 		b.scopes = append(b.scopes, scope)
 	}
-	// delete old token
-	b.token.Token = ""
 }
 
 var knownActions = []string{"pull", "push", "delete"}
@@ -609,9 +726,52 @@ func parseScope(scope string) (string, []string, bool) {
 	return scopeSplit[1], actionSplit, true
 }
 
+// bearerKeyLocked builds the cache key for the current realm, service, and scopes
+func (b *bearerHandler) bearerKeyLocked() bearerKey {
+	scopes := slices.Clone(b.scopes)
+	slices.Sort(scopes)
+	scopes = slices.DeleteFunc(scopes, func(s string) bool { return s == "" })
+	return bearerKey{
+		host:    b.host,
+		realm:   b.realm,
+		service: b.service,
+		scopes:  strings.Join(scopes, " "),
+	}
+}
+
+// resolveLocked looks up or creates the entry for the current identity,
+// carrying over the refresh token from the previous entry. A changed
+// identity starts a new generation. The caller must hold b.mu.
+func (b *bearerHandler) resolveLocked() *bearerEntry {
+	key := b.bearerKeyLocked()
+	if e, ok := b.entries[key]; ok {
+		if b.cur != e {
+			b.cur = e
+			b.generation++
+		}
+		return e
+	}
+	e := &bearerEntry{
+		key:    key,
+		scopes: slices.Clone(b.scopes),
+	}
+	// refresh tokens may be reused across scope sets within a realm
+	if b.cur != nil {
+		if rt := b.cur.refreshTokenLocked(); rt != "" {
+			e.token.RefreshToken = rt
+		}
+	}
+	b.entries[key] = e
+	b.cur = e
+	b.generation++
+	return e
+}
+
 // ProcessChallenge handles WWW-Authenticate header for bearer tokens
 // Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:samalba/my-app:pull,push"
 func (b *bearerHandler) ProcessChallenge(c challenge) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if _, ok := c.params["realm"]; !ok {
 		return errs.ErrInvalidChallenge
 	}
@@ -622,82 +782,229 @@ func (b *bearerHandler) ProcessChallenge(c challenge) error {
 		c.params["scope"] = ""
 	}
 
-	existingScope := b.scopeExists(c.params["scope"])
+	// a changed realm or service is a distinct token identity, e.g. the
+	// same image reached through mirrors fronting different auth servers
+	realmChanged := b.realm != "" && b.realm != c.params["realm"]
+	serviceChanged := b.service != "" && b.service != c.params["service"]
+	if realmChanged || serviceChanged {
+		b.realm = c.params["realm"]
+		b.service = c.params["service"]
+		b.scopes = []string{}
+		if c.params["scope"] != "" {
+			b.addScope(c.params["scope"])
+		}
+		// previous entries stay cached for requests already in flight
+		b.resolveLocked()
+		return nil
+	}
 
-	if b.realm == c.params["realm"] && b.service == c.params["service"] && existingScope && (b.token.Token == "" || !b.isExpired()) {
+	existingScope := b.scopeExists(c.params["scope"])
+	sameIdentity := b.realm == c.params["realm"] &&
+		b.service == c.params["service"] &&
+		existingScope &&
+		b.cur != nil &&
+		b.cur.usable()
+	if sameIdentity {
 		return errs.ErrNoNewChallenge
 	}
 
 	if b.realm == "" {
 		b.realm = c.params["realm"]
-	} else if b.realm != c.params["realm"] {
-		return errs.ErrInvalidChallenge
 	}
 	if b.service == "" {
 		b.service = c.params["service"]
-	} else if b.service != c.params["service"] {
-		return errs.ErrInvalidChallenge
 	}
 	if !existingScope {
 		b.addScope(c.params["scope"])
 	}
+	// new or expired identity: start the next generation, previous entries
+	// remain cached for requests already in flight
+	b.resolveLocked()
 	return nil
 }
 
-// UpdateRequest for BearerHandler adds a bearer token to the request.
+// UpdateRequest satisfies the handler interface; the bearer handler makes
+// outbound calls and is always invoked through UpdateRequestAsync.
 func (b *bearerHandler) UpdateRequest(req *http.Request) error {
-	// handle relative realm values
-	if b.tokenURL == nil {
-		u, err := req.URL.Parse(b.realm)
+	return b.UpdateRequestAsync(req)
+}
+
+// UpdateRequestAsync adds a bearer token to the request, coalescing
+// concurrent refreshes for the same identity. It runs without the Auth
+// mutex and uses its own locking.
+func (b *bearerHandler) UpdateRequestAsync(req *http.Request) error {
+	b.mu.Lock()
+	if b.realm == "" || b.cur == nil {
+		b.mu.Unlock()
+		return errs.ErrHTTPUnauthorized
+	}
+	e := b.cur
+	realm := b.realm
+	b.mu.Unlock()
+
+	// resolve the token URL once per identity, under the entry lock
+	e.refreshMu.Lock()
+	if e.tokenURL == nil {
+		u, err := req.URL.Parse(realm)
+		if err != nil {
+			e.refreshMu.Unlock()
+			return err
+		}
+		e.tokenURL = u
+	}
+	tokenURL := e.tokenURL
+	e.refreshMu.Unlock()
+
+	// verify tokenURL is allowed for request URL
+	if err := regnet.AllowRedirect(*req.URL, *tokenURL); err != nil {
+		return err
+	}
+
+	if err := e.ensureToken(b, req); err != nil {
+		return err
+	}
+	e.refreshMu.Lock()
+	token := e.token.Token
+	e.refreshMu.Unlock()
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+	return nil
+}
+
+// ensureToken returns a usable token for the entry, merging concurrent
+// refresh calls into a single outbound request. A caller canceling its own
+// request does not cancel the shared refresh. All reads and writes of the
+// cached token are guarded by refreshMu.
+func (e *bearerEntry) ensureToken(b *bearerHandler, req *http.Request) error {
+	e.refreshMu.Lock()
+	if e.token.Token != "" && !e.isExpiredLocked() {
+		e.refreshMu.Unlock()
+		return nil
+	}
+	if e.done != nil {
+		// another caller is already refreshing this identity
+		done := e.done
+		e.refreshMu.Unlock()
+		select {
+		case <-done:
+		case <-req.Context().Done():
+			return req.Context().Err()
+		}
+		e.refreshMu.Lock()
+		err := e.err
+		usable := e.token.Token != "" && !e.isExpiredLocked()
+		e.refreshMu.Unlock()
 		if err != nil {
 			return err
 		}
-		b.tokenURL = u
-	}
-	// verify tokenURL is allowed for request URL
-	if err := regnet.AllowRedirect(*req.URL, *b.tokenURL); err != nil {
-		return err
-	}
-	// if unexpired token already exists, return it
-	if b.token.Token != "" && !b.isExpired() {
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", b.token.Token))
+		if !usable {
+			return errs.ErrHTTPUnauthorized
+		}
 		return nil
 	}
-	// attempt to post if a refresh token is available or token auth is being used
+	// leader: run the refresh without the entry lock so waiters can join
+	done := make(chan struct{})
+	e.done = done
+	e.refreshMu.Unlock()
+
+	// detach from the leader's request context: the shared result must
+	// survive an individual caller canceling
+	ctx := context.WithoutCancel(req.Context())
+	err := e.fetchToken(b, ctx)
+
+	e.refreshMu.Lock()
+	e.err = err
+	e.done = nil
+	close(done)
+	e.refreshMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// isExpired returns true when token issue date is either 0, token has expired,
+// or will expire within buffer time. Caller must hold refreshMu.
+func (e *bearerEntry) isExpiredLocked() bool {
+	if e.token.IssuedAt.IsZero() {
+		return true
+	}
+	expireSec := e.token.IssuedAt.Add(time.Duration(e.token.ExpiresIn) * time.Second)
+	expireSec = expireSec.Add(tokenBuffer * -1)
+	return time.Now().After(expireSec)
+}
+
+// isExpired locks the entry before evaluating expiry.
+func (e *bearerEntry) isExpired() bool {
+	e.refreshMu.Lock()
+	defer e.refreshMu.Unlock()
+	return e.isExpiredLocked()
+}
+
+// usable reports whether the entry holds a non-empty, unexpired token.
+func (e *bearerEntry) usable() bool {
+	e.refreshMu.Lock()
+	defer e.refreshMu.Unlock()
+	return e.token.Token != "" && !e.isExpiredLocked()
+}
+
+// refreshTokenLocked returns the current refresh token under the entry lock.
+func (e *bearerEntry) refreshTokenLocked() string {
+	e.refreshMu.Lock()
+	defer e.refreshMu.Unlock()
+	return e.token.RefreshToken
+}
+
+// isExpired helper retained on the handler for the cached current entry
+func (b *bearerHandler) isExpired() bool {
+	if b.cur == nil {
+		return true
+	}
+	return b.cur.isExpired()
+}
+
+// fetchToken performs one refresh round for the entry, trying methods in a
+// fixed priority: authenticated POST (refresh/password), then authenticated
+// GET (basic), then an anonymous GET. Each method is attempted at most once
+// within the round, so a failed authentication is retried once rather than
+// hammered; a later expiry triggers a fresh round.
+func (e *bearerEntry) fetchToken(b *bearerHandler, ctx context.Context) error {
 	cred := b.credsFn(b.host)
-	if b.token.RefreshToken != "" || cred.Token != "" {
-		if err := b.tryPost(cred); err == nil {
-			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", b.token.Token))
+	e.refreshMu.Lock()
+	refreshToken := e.token.RefreshToken
+	e.refreshMu.Unlock()
+	hasCred := cred.User != "" && cred.Password != ""
+	canPost := refreshToken != "" || cred.Token != ""
+	canAuthGet := hasCred
+	canAnon := !hasCred && cred.Token == ""
+
+	if canPost {
+		if err := e.tryPost(b, ctx, cred, refreshToken); err == nil {
 			return nil
 		} else if err != errs.ErrHTTPUnauthorized {
 			return fmt.Errorf("failed to request auth token (post): %w%.0w", err, errs.ErrHTTPUnauthorized)
 		}
 	}
-	// attempt a get (with basic auth if user/pass available)
-	if err := b.tryGet(cred); err == nil {
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", b.token.Token))
-		return nil
-	} else if err != errs.ErrHTTPUnauthorized {
-		return fmt.Errorf("failed to request auth token (get): %w%.0w", err, errs.ErrHTTPUnauthorized)
+	if canAuthGet {
+		if err := e.tryGet(b, ctx, cred); err == nil {
+			return nil
+		} else if err != errs.ErrHTTPUnauthorized {
+			return fmt.Errorf("failed to request auth token (get): %w%.0w", err, errs.ErrHTTPUnauthorized)
+		}
+	}
+	if canAnon {
+		if err := e.tryGet(b, ctx, Cred{}); err == nil {
+			return nil
+		} else if err != errs.ErrHTTPUnauthorized {
+			return fmt.Errorf("failed to request auth token (anonymous get): %w%.0w", err, errs.ErrHTTPUnauthorized)
+		}
 	}
 	return errs.ErrHTTPUnauthorized
 }
 
-// isExpired returns true when token issue date is either 0, token has expired,
-// or will expire within buffer time
-func (b *bearerHandler) isExpired() bool {
-	if b.token.IssuedAt.IsZero() {
-		return true
-	}
-	expireSec := b.token.IssuedAt.Add(time.Duration(b.token.ExpiresIn) * time.Second)
-	expireSec = expireSec.Add(tokenBuffer * -1)
-	return time.Now().After(expireSec)
-}
-
 // tryGet requests a new token with a GET request
-func (b *bearerHandler) tryGet(cred Cred) error {
+func (e *bearerEntry) tryGet(b *bearerHandler, ctx context.Context, cred Cred) error {
 	//#nosec G704 inputs follow specification
-	req, err := http.NewRequest("GET", b.tokenURL.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", e.tokenURL.String(), nil)
 	if err != nil {
 		return err
 	}
@@ -709,7 +1016,7 @@ func (b *bearerHandler) tryGet(cred Cred) error {
 		reqParams.Add("service", b.service)
 	}
 
-	for _, s := range b.scopes {
+	for _, s := range e.scopes {
 		reqParams.Add("scope", s)
 	}
 
@@ -724,26 +1031,30 @@ func (b *bearerHandler) tryGet(cred Cred) error {
 	//#nosec G704 inputs follow specification
 	resp, err := b.client.Do(req)
 	if err != nil {
+		b.slog.Debug("Auth token GET failed",
+			slog.String("host", b.host),
+			slog.String("url", redactURL(e.tokenURL.String())),
+			slog.String("err", redactError(err).Error()))
 		return err
 	}
 	defer resp.Body.Close()
 
-	return b.validateResponse(resp)
+	return e.validateResponse(b, resp)
 }
 
 // tryPost requests a new token via a POST request
-func (b *bearerHandler) tryPost(cred Cred) error {
+func (e *bearerEntry) tryPost(b *bearerHandler, ctx context.Context, cred Cred, refreshToken string) error {
 	form := url.Values{}
-	if len(b.scopes) > 0 {
-		form.Set("scope", strings.Join(b.scopes, " "))
+	if len(e.scopes) > 0 {
+		form.Set("scope", strings.Join(e.scopes, " "))
 	}
 	if b.service != "" {
 		form.Set("service", b.service)
 	}
 	form.Set("client_id", b.clientID)
-	if b.token.RefreshToken != "" {
+	if refreshToken != "" {
 		form.Set("grant_type", "refresh_token")
-		form.Set("refresh_token", b.token.RefreshToken)
+		form.Set("refresh_token", refreshToken)
 	} else if cred.Token != "" {
 		form.Set("grant_type", "refresh_token")
 		form.Set("refresh_token", cred.Token)
@@ -754,7 +1065,7 @@ func (b *bearerHandler) tryPost(cred Cred) error {
 	}
 
 	//#nosec G704 inputs are user controlled or follow specification
-	req, err := http.NewRequest("POST", b.tokenURL.String(), strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", e.tokenURL.String(), strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
 	}
@@ -764,11 +1075,15 @@ func (b *bearerHandler) tryPost(cred Cred) error {
 	//#nosec G704 inputs are user controlled or follow specification
 	resp, err := b.client.Do(req)
 	if err != nil {
+		b.slog.Debug("Auth token POST failed",
+			slog.String("host", b.host),
+			slog.String("url", redactURL(e.tokenURL.String())),
+			slog.String("err", redactError(err).Error()))
 		return err
 	}
 	defer resp.Body.Close()
 
-	return b.validateResponse(resp)
+	return e.validateResponse(b, resp)
 }
 
 // scopeExists check if the scope already exists within the list of scopes
@@ -805,21 +1120,28 @@ func (b *bearerHandler) scopeExists(search string) bool {
 }
 
 // validateResponse extracts the returned token
-func (b *bearerHandler) validateResponse(resp *http.Response) error {
+func (e *bearerEntry) validateResponse(b *bearerHandler, resp *http.Response) error {
 	if resp.StatusCode != 200 {
 		return errs.ErrHTTPUnauthorized
 	}
 
-	// decode response and if successful, update token
+	// decode response before taking the entry lock
 	decoder := json.NewDecoder(resp.Body)
 	decoded := bearerToken{}
 	if err := decoder.Decode(&decoded); err != nil {
 		return err
 	}
-	b.token = decoded
 
-	if b.token.ExpiresIn < minTokenLife {
-		b.token.ExpiresIn = minTokenLife
+	e.refreshMu.Lock()
+	defer e.refreshMu.Unlock()
+	if decoded.RefreshToken == "" {
+		// preserve a previously issued refresh token when the response omits one
+		decoded.RefreshToken = e.token.RefreshToken
+	}
+	e.token = decoded
+
+	if e.token.ExpiresIn < minTokenLife {
+		e.token.ExpiresIn = minTokenLife
 	}
 
 	// If token is already expired, it was sent with a zero value or
@@ -827,14 +1149,20 @@ func (b *bearerHandler) validateResponse(resp *http.Response) error {
 	// Also handle cases of remote time in the future.
 	// But if remote time is slightly in the past, leave as is so token
 	// expires here before the server.
-	if b.isExpired() || b.token.IssuedAt.After(time.Now()) {
-		b.token.IssuedAt = time.Now().UTC()
+	if e.isExpiredLocked() || e.token.IssuedAt.After(time.Now()) {
+		e.token.IssuedAt = time.Now().UTC()
 	}
 
 	// AccessToken and Token should be the same and we use Token elsewhere
-	if b.token.AccessToken != "" {
-		b.token.Token = b.token.AccessToken
+	if e.token.AccessToken != "" {
+		e.token.Token = e.token.AccessToken
 	}
+
+	b.slog.Debug("Auth token received",
+		slog.String("host", b.host),
+		slog.String("realm", e.key.realm),
+		slog.String("service", e.key.service),
+		slog.Uint64("generation", b.generation))
 
 	return nil
 }

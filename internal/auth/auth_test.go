@@ -638,7 +638,7 @@ func TestBearer(t *testing.T) {
 	}
 
 	// send a third request with same challenge after token expires
-	bearer.token.IssuedAt = time.Now().Add(-900 * time.Second)
+	bearer.cur.token.IssuedAt = time.Now().Add(-900 * time.Second)
 	err = bearer.AddScope("repository:reponame:pull")
 	if err != nil && !errors.Is(err, errs.ErrNoNewChallenge) {
 		t.Errorf("failed adding scope: %v", err)
@@ -675,11 +675,11 @@ func TestBearer(t *testing.T) {
 	if bearer.isExpired() {
 		t.Errorf("token2 (push) is already expired")
 	}
-	if bearer.token.IssuedAt.After(time.Now().UTC()) {
+	if bearer.cur.token.IssuedAt.After(time.Now().UTC()) {
 		t.Errorf("token2 (push) is after current time")
 	}
-	if bearer.token.ExpiresIn < minTokenLife {
-		t.Errorf("token2 (push) expires early, expected %d, received %d", minTokenLife, bearer.token.ExpiresIn)
+	if bearer.cur.token.ExpiresIn < minTokenLife {
+		t.Errorf("token2 (push) expires early, expected %d, received %d", minTokenLife, bearer.cur.token.ExpiresIn)
 	}
 
 	// send a request for a new scope with new repo
@@ -698,11 +698,11 @@ func TestBearer(t *testing.T) {
 	if bearer.isExpired() {
 		t.Errorf("token3 (delete) is already expired")
 	}
-	if bearer.token.IssuedAt.After(time.Now().UTC()) {
+	if bearer.cur.token.IssuedAt.After(time.Now().UTC()) {
 		t.Errorf("token3 (delete) is after current time")
 	}
-	if bearer.token.ExpiresIn < minTokenLife {
-		t.Errorf("token3 (delete) expires early, expected %d, received %d", minTokenLife, bearer.token.ExpiresIn)
+	if bearer.cur.token.ExpiresIn < minTokenLife {
+		t.Errorf("token3 (delete) expires early, expected %d, received %d", minTokenLife, bearer.cur.token.ExpiresIn)
 	}
 
 	// send a request for a new scope with an unknown action
@@ -721,11 +721,11 @@ func TestBearer(t *testing.T) {
 	if bearer.isExpired() {
 		t.Errorf("token4 (custom) is already expired")
 	}
-	if bearer.token.IssuedAt.After(time.Now().UTC()) {
+	if bearer.cur.token.IssuedAt.After(time.Now().UTC()) {
 		t.Errorf("token4 (custom) is after current time")
 	}
-	if bearer.token.ExpiresIn < minTokenLife {
-		t.Errorf("token4 (custom) expires early, expected %d, received %d", minTokenLife, bearer.token.ExpiresIn)
+	if bearer.cur.token.ExpiresIn < minTokenLife {
+		t.Errorf("token4 (custom) expires early, expected %d, received %d", minTokenLife, bearer.cur.token.ExpiresIn)
 	}
 
 	// send a request for a new known action having multiple scopes
@@ -744,11 +744,11 @@ func TestBearer(t *testing.T) {
 	if bearer.isExpired() {
 		t.Errorf("token5 (push,pull) is already expired")
 	}
-	if bearer.token.IssuedAt.After(time.Now().UTC()) {
+	if bearer.cur.token.IssuedAt.After(time.Now().UTC()) {
 		t.Errorf("token5 (push,pull) is after current time")
 	}
-	if bearer.token.ExpiresIn < minTokenLife {
-		t.Errorf("token5 (push,pull) expires early, expected %d, received %d", minTokenLife, bearer.token.ExpiresIn)
+	if bearer.cur.token.ExpiresIn < minTokenLife {
+		t.Errorf("token5 (push,pull) expires early, expected %d, received %d", minTokenLife, bearer.cur.token.ExpiresIn)
 	}
 
 	// send new request without another challenge
