@@ -65,7 +65,7 @@ type Reg struct {
 	blobMaxPut      int64
 	manifestMaxPull int64
 	manifestMaxPush int64
-	cacheMan        *cache.Cache[ref.Ref, manifest.Manifest]
+	cacheMan        *cache.Cache[manCacheKey, manifest.Manifest]
 	cacheRL         *cache.Cache[ref.Ref, referrer.ReferrerList]
 	muHost          sync.Mutex
 	muRefTag        sync.Mutex
@@ -187,7 +187,7 @@ func WithBlobLimit(limit int64) Opts {
 // WithCache defines a cache used for various requests
 func WithCache(timeout time.Duration, count int) Opts {
 	return func(r *Reg) {
-		cm := cache.New[ref.Ref, manifest.Manifest](cache.WithAge(timeout), cache.WithCount(count))
+		cm := cache.New[manCacheKey, manifest.Manifest](cache.WithAge(timeout), cache.WithCount(count))
 		r.cacheMan = &cm
 		crl := cache.New[ref.Ref, referrer.ReferrerList](cache.WithAge(timeout), cache.WithCount(count))
 		r.cacheRL = &crl

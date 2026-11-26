@@ -46,9 +46,9 @@ type API interface {
 	// ManifestDelete removes a manifest, including all tags that point to that manifest.
 	ManifestDelete(ctx context.Context, r ref.Ref, opts ...ManifestOpts) error
 	// ManifestGet retrieves a manifest from a repository.
-	ManifestGet(ctx context.Context, r ref.Ref) (manifest.Manifest, error)
+	ManifestGet(ctx context.Context, r ref.Ref, opts ...ManifestOpts) (manifest.Manifest, error)
 	// ManifestHead gets metadata about the manifest (existence, digest, mediatype, size).
-	ManifestHead(ctx context.Context, r ref.Ref) (manifest.Manifest, error)
+	ManifestHead(ctx context.Context, r ref.Ref, opts ...ManifestOpts) (manifest.Manifest, error)
 	// ManifestPut sends a manifest to the repository.
 	ManifestPut(ctx context.Context, r ref.Ref, m manifest.Manifest, opts ...ManifestOpts) error
 
@@ -88,6 +88,10 @@ type ManifestConfig struct {
 	CheckReferrers bool
 	Child          bool // used when pushing a child of a manifest list, skips indexing in ocidir
 	Manifest       manifest.Manifest
+	// ParentDigest binds a fetched child manifest to the digest of the index that
+	// referenced it. Cache implementations can use it to keep selections from
+	// different generations of a parent index separate.
+	ParentDigest string
 }
 
 // ManifestOpts is used to set options on manifest APIs.
@@ -107,6 +111,15 @@ func WithManifestCheckReferrers() ManifestOpts {
 func WithManifestChild() ManifestOpts {
 	return func(config *ManifestConfig) {
 		config.Child = true
+	}
+}
+
+// WithManifestParentDigest binds a child manifest to a parent index digest.
+// This is used during platform resolution so cached child manifests cannot be
+// reused for a different generation of the parent index.
+func WithManifestParentDigest(parentDigest string) ManifestOpts {
+	return func(config *ManifestConfig) {
+		config.ParentDigest = parentDigest
 	}
 }
 

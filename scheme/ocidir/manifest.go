@@ -109,7 +109,7 @@ func (o *OCIDir) ManifestDelete(ctx context.Context, r ref.Ref, opts ...scheme.M
 }
 
 // ManifestGet retrieves a manifest from a repository
-func (o *OCIDir) ManifestGet(ctx context.Context, r ref.Ref) (manifest.Manifest, error) {
+func (o *OCIDir) ManifestGet(ctx context.Context, r ref.Ref, _ ...scheme.ManifestOpts) (manifest.Manifest, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.manifestGet(ctx, r)
@@ -169,7 +169,7 @@ func (o *OCIDir) manifestGet(_ context.Context, r ref.Ref) (manifest.Manifest, e
 }
 
 // ManifestHead gets metadata about the manifest (existence, digest, mediatype, size)
-func (o *OCIDir) ManifestHead(ctx context.Context, r ref.Ref) (manifest.Manifest, error) {
+func (o *OCIDir) ManifestHead(ctx context.Context, r ref.Ref, _ ...scheme.ManifestOpts) (manifest.Manifest, error) {
 	index, err := o.readIndex(r, false)
 	if err != nil {
 		return nil, fmt.Errorf("unable to read oci index: %w", err)

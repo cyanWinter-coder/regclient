@@ -74,7 +74,7 @@ func (reg *Reg) ManifestDelete(ctx context.Context, r ref.Ref, opts ...scheme.Ma
 			}
 		}
 	}
-	rCache := r.SetDigest(r.Digest)
+	rCache := newManCacheKey(r.SetDigest(r.Digest), "")
 	reg.cacheMan.Delete(rCache)
 
 	// build/send request
@@ -99,10 +99,14 @@ func (reg *Reg) ManifestDelete(ctx context.Context, r ref.Ref, opts ...scheme.Ma
 }
 
 // ManifestGet retrieves a manifest from the registry
-func (reg *Reg) ManifestGet(ctx context.Context, r ref.Ref) (manifest.Manifest, error) {
+func (reg *Reg) ManifestGet(ctx context.Context, r ref.Ref, opts ...scheme.ManifestOpts) (manifest.Manifest, error) {
+	mc := scheme.ManifestConfig{}
+	for _, opt := range opts {
+		opt(&mc)
+	}
 	var tagOrDigest string
 	if r.Digest != "" {
-		rCache := r.SetDigest(r.Digest)
+		rCache := newManCacheKey(r.SetDigest(r.Digest), mc.ParentDigest)
 		if m, err := reg.cacheMan.Get(rCache); err == nil {
 			return m, nil
 		}
@@ -164,19 +168,33 @@ func (reg *Reg) ManifestGet(ctx context.Context, r ref.Ref) (manifest.Manifest, 
 		manifest.WithRaw(rawBody),
 	)
 	if err != nil {
+		// A digest mismatch means the entry for this exact manifest is not usable.
+		// Evict only entries for this child/parent pair and its top-level binding;
+		// entries for other digests remain in the shared registry cache.
+		if errors.Is(err, errs.ErrDigestMismatch) && r.Digest != "" {
+			pinned := r.SetDigest(r.Digest)
+			reg.cacheMan.Delete(newManCacheKey(pinned, mc.ParentDigest))
+			if mc.ParentDigest != "" {
+				reg.cacheMan.Delete(newManCacheKey(pinned, ""))
+			}
+		}
 		return nil, err
 	}
-	rCache := r.SetDigest(m.GetDescriptor().Digest.String())
+	rCache := newManCacheKey(r.SetDigest(m.GetDescriptor().Digest.String()), mc.ParentDigest)
 	reg.cacheMan.Set(rCache, m)
 	return m, nil
 }
 
 // ManifestHead returns metadata on the manifest from the registry
-func (reg *Reg) ManifestHead(ctx context.Context, r ref.Ref) (manifest.Manifest, error) {
+func (reg *Reg) ManifestHead(ctx context.Context, r ref.Ref, opts ...scheme.ManifestOpts) (manifest.Manifest, error) {
+	mc := scheme.ManifestConfig{}
+	for _, opt := range opts {
+		opt(&mc)
+	}
 	// build the request
 	var tagOrDigest string
 	if r.Digest != "" {
-		rCache := r.SetDigest(r.Digest)
+		rCache := newManCacheKey(r.SetDigest(r.Digest), mc.ParentDigest)
 		if m, err := reg.cacheMan.Get(rCache); err == nil {
 			return m, nil
 		}
@@ -349,7 +367,7 @@ func (reg *Reg) ManifestPut(ctx context.Context, r ref.Ref, m manifest.Manifest,
 		}
 	}
 
-	rCache := r.SetDigest(m.GetDescriptor().Digest.String())
+	rCache := newManCacheKey(r.SetDigest(m.GetDescriptor().Digest.String()), "")
 	reg.cacheMan.Set(rCache, m)
 
 	// update referrers if defined on this manifest

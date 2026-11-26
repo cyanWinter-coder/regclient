@@ -140,14 +140,23 @@ func (rc *RegClient) ManifestGet(ctx context.Context, r ref.Ref, opts ...Manifes
 			slog.String("platform", opt.platform.String()),
 			slog.String("ref", r.CommonName()))
 	}
+	// Pin the top-level digest before selecting a platform. This makes tag
+	// resolution a single transaction: selection and child fetches use the index
+	// generation that was originally retrieved, even if the tag moves concurrently.
+	cacheParentDigest := ""
+	if topDigest := m.GetDescriptor().Digest.String(); topDigest != "" && r.Digest == "" {
+		r = r.SetDigest(topDigest)
+	}
 	// this will loop to handle a nested index
 	for opt.platform != nil && m.IsList() {
+		parentDigest := m.GetDescriptor().Digest.String()
 		d, err := manifest.GetPlatformDesc(m, opt.platform)
 		if err != nil {
-			return m, err
+			return m, fmt.Errorf("platform not found: %s%.0w", *opt.platform, errs.ErrNotFound)
 		}
 		r = r.SetDigest(d.Digest.String())
-		m, err = schemeAPI.ManifestGet(ctx, r)
+		cacheParentDigest = parentDigest
+		m, err = schemeAPI.ManifestGet(ctx, r, scheme.WithManifestParentDigest(cacheParentDigest))
 		if err != nil {
 			return m, err
 		}
@@ -181,23 +190,37 @@ func (rc *RegClient) ManifestHead(ctx context.Context, r ref.Ref, opts ...Manife
 			slog.String("platform", opt.platform.String()),
 			slog.String("ref", r.CommonName()))
 	}
+	// Pin the top-level digest before fetching an index body. Otherwise a tag can
+	// move between HEAD and GET, making the platform selection read another generation.
+	cacheParentDigest := ""
+	if topDigest := m.GetDescriptor().Digest.String(); topDigest != "" && r.Digest == "" {
+		r = r.SetDigest(topDigest)
+	}
 	// this will loop to handle a nested index
 	for opt.platform != nil && m.IsList() {
 		if !m.IsSet() {
-			m, err = schemeAPI.ManifestGet(ctx, r)
+			m, err = schemeAPI.ManifestGet(ctx, r, scheme.WithManifestParentDigest(cacheParentDigest))
+			if err != nil {
+				return m, err
+			}
+			if parentDigest := m.GetDescriptor().Digest.String(); parentDigest != "" && r.Digest == "" {
+				r = r.SetDigest(parentDigest)
+			}
 		}
+		parentDigest := m.GetDescriptor().Digest.String()
 		d, err := manifest.GetPlatformDesc(m, opt.platform)
 		if err != nil {
-			return m, err
+			return m, fmt.Errorf("platform not found: %s%.0w", *opt.platform, errs.ErrNotFound)
 		}
 		r = r.SetDigest(d.Digest.String())
-		m, err = schemeAPI.ManifestHead(ctx, r)
+		cacheParentDigest = parentDigest
+		m, err = schemeAPI.ManifestHead(ctx, r, scheme.WithManifestParentDigest(cacheParentDigest))
 		if err != nil {
 			return m, err
 		}
 	}
 	if opt.requireDigest && m.GetDescriptor().Digest.String() == "" {
-		m, err = schemeAPI.ManifestGet(ctx, r)
+		m, err = schemeAPI.ManifestGet(ctx, r, scheme.WithManifestParentDigest(cacheParentDigest))
 	}
 	return m, err
 }
